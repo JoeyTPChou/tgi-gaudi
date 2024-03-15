@@ -2,8 +2,9 @@ import inspect
 import torch
 
 from abc import ABC, abstractmethod
-from typing import List, Optional, Tuple, Type, TypeVar
+from typing import List, Optional, Tuple, Type, TypeVar, Union
 from transformers import PreTrainedTokenizerBase
+from transformers.models.llava.processing_llava import LlavaProcessor
 
 from text_generation_server.models.types import Batch, GeneratedText
 from text_generation_server.pb.generate_pb2 import InfoResponse
@@ -15,7 +16,7 @@ class Model(ABC):
     def __init__(
         self,
         model: torch.nn.Module,
-        tokenizer: PreTrainedTokenizerBase,
+        tokenizer: Union[PreTrainedTokenizerBase, LlavaProcessor],
         requires_padding: bool,
         dtype: torch.dtype,
         device: torch.device,
@@ -25,7 +26,10 @@ class Model(ABC):
     ):
         self.model = model
         self.tokenizer = tokenizer
-        self.all_special_ids = set(tokenizer.all_special_ids)
+        if isinstance(tokenizer, LlavaProcessor):
+            self.all_special_ids = set(tokenizer.tokenizer.all_special_ids)
+        else:
+            self.all_special_ids = set(tokenizer.all_special_ids)
         self.requires_padding = requires_padding
         self.dtype = dtype
         self.device = device
@@ -35,6 +39,12 @@ class Model(ABC):
         self.has_position_ids = inspect.signature(model.forward).parameters.get("position_ids", None) is not None
 
         self.check_initialized()
+
+    @property
+    def processor(self) -> LlavaProcessor:
+        """Return LlavaProcessor processor if the model is a Llava model else None
+        """
+        return self.tokenizer if isinstance(self.tokenizer, LlavaProcessor) else None
 
     @property
     def info(self) -> InfoResponse:

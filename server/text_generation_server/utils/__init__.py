@@ -19,6 +19,7 @@ from text_generation_server.utils.tokens import (
     Sampling,
     Greedy,
     make_tokenizer_optional,
+    make_processor_optional,
     is_tokenizer_transparent
 )
 

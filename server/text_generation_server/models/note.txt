@@ -1,0 +1,4 @@
+* Add image_processor to Llava class
+* Add image preprocessing stage llava.generate_token
+* Use transformers/src/transformers/pipelines/image_to_text.py as reference 
+* Check if need to use `hpu_graphs`

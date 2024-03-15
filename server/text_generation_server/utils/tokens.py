@@ -132,8 +132,12 @@ class StoppingCriteria:
         tokenizer: PreTrainedTokenizerBase,
     ) -> "StoppingCriteria":
         stop_sequence_criterias = [StopSequenceCriteria(sequence) for sequence in pb.stop_sequences]
+        if not isinstance(tokenizer, PreTrainedTokenizerBase):
+            eos_token_id = tokenizer.tokenizer.eos_token_id
+        else:
+            eos_token_id = tokenizer.eos_token_id
         return StoppingCriteria(
-            tokenizer.eos_token_id,
+            eos_token_id,
             stop_sequence_criterias,
             pb.max_new_tokens,
             pb.ignore_eos_token,
@@ -408,6 +412,61 @@ def make_tokenizer_optional(tokenizer):
     if os.getenv("SKIP_TOKENIZER_IN_TGI", "false").lower() == "true":
         tokenizer.__class__ = _
         tokenizer.is_transparent = True
+
+
+def make_processor_optional(processor):
+    """
+    Used by Llava (ImageToText) and this is yet to be verified
+    """
+    class _(type(processor)):
+        def __call__(
+            self,
+            text,
+            image,
+            return_tensors,
+            padding,
+            return_token_type_ids,
+            truncation,
+            max_length
+        ):
+            assert return_tensors == "pt", "inccorrect input arguments when calling TransparentTokenizer"
+            assert padding == "max_length" or padding == "longest", "inccorrect input arguments when calling TransparentTokenizer"
+            assert return_token_type_ids == False, "inccorrect input arguments when calling TransparentTokenizer"
+            assert truncation == True, "inccorrect input arguments when calling TransparentTokenizer"
+
+            def str_token_to_int(i):
+                if i == '?':
+                    return processor.pad_token_id
+                else:
+                    return int(i)
+
+            def str_image_to_float(i):
+                return float(i)
+
+            all_tokens = [[str_token_to_int(i.strip()) for i in inner_text.split(',')]
+                          for inner_text in text]
+            all_images = [[str_image_to_float(i) for i in inner_image.split(',')]
+                          for inner_image in image]
+            if padding == "longest":
+                max_length = max(len(tokens) for tokens in all_tokens)
+            return {"input_ids": torch.tensor([[processor.pad_token_id] * (max_length - len(tokens)) + tokens for tokens in all_tokens], dtype=torch.int32),
+                    "pixel_values": torch.tensor(all_images, dtype=torch.float32),
+                    "attention_mask": torch.tensor([[0] * (max_length - len(tokens)) + [1] * len(tokens) for tokens in all_tokens], dtype=torch.int32)}
+
+        def decode(
+            self,
+            token_ids,
+            skip_special_tokens: bool = False,
+            clean_up_tokenization_spaces: bool = None,
+            **kwargs,
+        ) -> str:
+            # TODO(Joey Chou): Check if need to take care of images
+            return ','.join(str(i) for i in to_py_obj(token_ids))
+
+    import os
+    if os.getenv("SKIP_TOKENIZER_IN_TGI", "false").lower() == "true":
+        processor.__class__ = _
+        processor.is_transparent = True
 
 
 def is_tokenizer_transparent(tokenizer):

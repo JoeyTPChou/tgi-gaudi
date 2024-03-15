@@ -59,7 +59,9 @@ RUN cd server && \
     make gen-server && \
     pip install -r requirements.txt && \
     pip install git+https://github.com/HabanaAI/DeepSpeed.git@1.14.0 && \
-    pip install . --no-cache-dir
+    pip install . --no-cache-dir \
+    pip install git+https://github.com/huggingface/optimum-habana.git@d44c54066aef31462206a4d3d4a4b4e93a72dd01 \
+    pip install ipdb
 
 # Install benchmarker
 COPY --from=builder /usr/src/target/release/text-generation-benchmark /usr/local/bin/text-generation-benchmark
@@ -71,5 +73,5 @@ COPY --from=builder /usr/src/target/release/text-generation-launcher /usr/local/
 # Final image
 FROM base
 
-ENTRYPOINT ["text-generation-launcher"]
-CMD ["--json-output"]
+# ENTRYPOINT ["text-generation-launcher"]
+# CMD ["--json-output"]

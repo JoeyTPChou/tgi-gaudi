@@ -61,6 +61,7 @@ class Client:
     def generate(
         self,
         prompt: str,
+        image: Optional[str] = None,
         do_sample: bool = False,
         max_new_tokens: int = 20,
         best_of: Optional[int] = None,
@@ -139,7 +140,7 @@ class Client:
             decoder_input_details=decoder_input_details,
             top_n_tokens=top_n_tokens,
         )
-        request = Request(inputs=prompt, stream=False, parameters=parameters)
+        request = Request(inputs=prompt, images=image, stream=False, parameters=parameters)
 
         resp = requests.post(
             self.base_url,
@@ -156,6 +157,7 @@ class Client:
     def generate_stream(
         self,
         prompt: str,
+        image: Optional[str] = None,
         do_sample: bool = False,
         max_new_tokens: int = 20,
         repetition_penalty: Optional[float] = None,
@@ -311,6 +313,7 @@ class AsyncClient:
     async def generate(
         self,
         prompt: str,
+        image: Optional[str] = None,
         do_sample: bool = False,
         max_new_tokens: int = 20,
         best_of: Optional[int] = None,
@@ -404,6 +407,7 @@ class AsyncClient:
     async def generate_stream(
         self,
         prompt: str,
+        image: Optional[str] = None,
         do_sample: bool = False,
         max_new_tokens: int = 20,
         repetition_penalty: Optional[float] = None,

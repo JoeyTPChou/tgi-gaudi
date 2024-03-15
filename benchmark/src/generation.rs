@@ -151,6 +151,7 @@ async fn prefill(
                 ignore_eos_token: true, // Will not stop even if a eos token is generated
             }),
             top_n_tokens: top_n_tokens.unwrap_or(0),
+            images: None,
         })
         .collect();
 

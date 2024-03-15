@@ -117,6 +117,8 @@ class Request(BaseModel):
     parameters: Optional[Parameters] = None
     # Whether to stream output tokens
     stream: bool = False
+    # Image
+    images: str
 
     @validator("inputs")
     def valid_input(cls, v):

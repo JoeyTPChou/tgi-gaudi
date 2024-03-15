@@ -181,6 +181,7 @@ impl Client {
                 }),
                 prefill_logprobs: false,
                 top_n_tokens: 0,
+                images: None,
             });
         }
 

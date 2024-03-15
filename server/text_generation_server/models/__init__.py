@@ -9,6 +9,7 @@ from text_generation_server.models.model import Model
 from text_generation_server.models.causal_lm import CausalLM
 from text_generation_server.models.bloom import BLOOM
 from text_generation_server.models.santacoder import SantaCoder
+from text_generation_server.models.llava import Llava
 
 
 # Disable gradients
@@ -28,6 +29,9 @@ def get_model(
 
     if model_type == "bloom":
         return BLOOM(model_id, revision, dtype)
+
+    if model_type == "llava":
+        return Llava(model_id, revision, dtype)
 
     if model_type in modeling_auto.MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
         return CausalLM(model_id, revision, dtype)

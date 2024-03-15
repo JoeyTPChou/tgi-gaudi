@@ -8,7 +8,9 @@ import torch
 
 from dataclasses import dataclass
 from opentelemetry import trace
-from transformers import AutoTokenizer, AutoModelForCausalLM, PreTrainedTokenizerBase, AutoConfig
+from transformers import AutoProcessor, AutoTokenizer, PreTrainedTokenizerBase, AutoConfig
+from transformers.models.llava.processing_llava import LlavaProcessor
+from transformers import BatchFeature
 from typing import Optional, Tuple, List, Type, Dict
 
 import text_generation_server.habana_quantization_env as hq_env
@@ -34,8 +36,9 @@ from text_generation_server.models.types import (
     TopTokens,
 )
 from text_generation_server.pb import generate_pb2
-from text_generation_server.utils import HeterogeneousNextTokenChooser, StoppingCriteria, Sampling, make_tokenizer_optional, is_tokenizer_transparent
+from text_generation_server.utils import HeterogeneousNextTokenChooser, StoppingCriteria, Sampling, make_processor_optional, is_tokenizer_transparent
 from text_generation_server.utils.debug import dbg_trace
+from text_generation_server.utils.images import b64_encode, b64_decode 
 from loguru import logger
 from functools import wraps
 
@@ -78,7 +81,12 @@ def biggest_single_chunk(offset):
 def grouped_pad(tensor_groups, dims, values):
     grouped_result = []
     for tensors, dim, value in zip(tensor_groups, dims, values):
-        padding = MAX_TOTAL_TOKENS - tensors[0].size(dim) if dim is not None else 0
+        if tensors[0] is not None:
+            padding = MAX_TOTAL_TOKENS - tensors[0].size(dim) if dim is not None else 0
+        else:
+            # pixel_values may be None, skip padding it
+            padding = 0
+
         if padding > 0:
             assert dim in [-1, -2], f'Only dims -1 and -2 are supported! {dim}'
             pad_shape = (0, 0, 0, padding) if dim == -2 else (0, padding)
@@ -117,6 +125,8 @@ def move(dst_tensors, dst_indices, src_tensors):
     bs_dim = 0
     num_indices = dst_indices.size(0)
     for i, (dst_t, src_t) in enumerate(zip(dst_tensors, src_tensors)):
+        if src_t is None and dst_t is None:
+            continue
         if src_t.size(bs_dim) != num_indices:
             src_t = torch.narrow(src_t, bs_dim, 0, num_indices)
         dst_t.index_copy_(bs_dim, dst_indices, src_t)
@@ -135,7 +145,11 @@ def extend_tensor(tensor, padding, dim):
 
 
 def extend_batch(tensors, target_bs, dim):
-    diff = target_bs - tensors[0].size(dim)
+    if tensors[0] is None:
+        return [None] * target_bs 
+    else:
+        size = tensors[0].size(dim)
+    diff = target_bs - size 
     # TODO: add support for shrinking bs
     if diff <= 0:
         return tensors
@@ -187,7 +201,7 @@ def remove_kv_cache_from_output(module):
 
 
 @dataclass
-class CausalLMRequest:
+class LlavaRequest:
     idx: int
     data: generate_pb2.Request
     input_length: int
@@ -215,12 +229,12 @@ class CausalLMRequest:
 
 
 @dataclass
-class CausalLMBatch(Batch):
+class LlavaBatch(Batch):
     batch_id: int
-    requests: List[CausalLMRequest]
+    requests: List[LlavaRequest]
 
     # Decoder values
-    input_ids: torch.Tensor
+    input_ids: torch.Tensor  # text
     attention_mask: torch.Tensor
     position_ids: torch.Tensor
     past_key_values: Optional[List[Tuple]]
@@ -235,6 +249,7 @@ class CausalLMBatch(Batch):
 
     logits = None
     past = None
+    pixel_values: Optional[torch.FloatTensor] = None # image
 
     def to_pb(self) -> generate_pb2.CachedBatch:
         return generate_pb2.CachedBatch(
@@ -281,14 +296,15 @@ class CausalLMBatch(Batch):
         seq_dim = -1
         key_dim = -2  # TODO: Add case for Bloom and other models
         value_dim = -2
-        tensors = [[self.input_ids], [self.attention_mask], [self.position_ids], past_keys, past_values]
-        # We don't need to align position_ids
-        seq_dims = [seq_dim, seq_dim, None, key_dim, value_dim]
-        bs_dims = [0, 0, 0] + ([1, 1] if self.merged_kv_cache else [0, 0])
+        tensors = [[self.input_ids], [self.pixel_values], [self.attention_mask], [self.position_ids], past_keys, past_values]
+        # We don't need to align pixel_values and position_ids
+        seq_dims = [seq_dim, None, seq_dim, None, key_dim, value_dim]
+        bs_dims = [0, 0, 0, 0] + ([1, 1] if self.merged_kv_cache else [0, 0])
         return tensors, seq_dims, bs_dims
 
     def set_tensor_groups(self, tensors):
         self.input_ids = tensors.pop(0)[0]
+        self.pixel_values = tensors.pop(0)[0]
         self.attention_mask = tensors.pop(0)[0]
         self.position_ids = tensors.pop(0)[0]
         past_keys = tensors.pop(0)
@@ -297,7 +313,7 @@ class CausalLMBatch(Batch):
 
     def realign(self, target_bs, offset, pad_token_id):
         tensors, seq_dims, _ = self.get_tensor_groups()
-        tensors = grouped_pad(tensors, seq_dims, [pad_token_id, 0, 0, 0, 0])
+        tensors = grouped_pad(tensors, seq_dims, [pad_token_id, 0, 0, 0, 0, 0])
         tensors = grouped_shift(tensors, seq_dims, offset, self.merged_kv_cache)
         self.set_tensor_groups(tensors)
 
@@ -328,7 +344,7 @@ class CausalLMBatch(Batch):
         self.set_tensor_groups(dst_tensors)
 
     @classmethod
-    def recombine(cls, batches: List["CausalLMBatch"], pad_token_id: int) -> "CausalLMBatch":
+    def recombine(cls, batches: List["LlavaBatch"], pad_token_id: int) -> "LlavaBatch":
         total_requests = sum(len(b) for b in batches)
         new_bs = round_up(total_requests, BATCH_BUCKET_SIZE)
         batch_id = batches[0].batch_id
@@ -387,6 +403,7 @@ class CausalLMBatch(Batch):
         )
 
         input_ids = batches[dst_batch_idx].input_ids
+        pixel_values = batches[dst_batch_idx].pixel_values
         attention_mask = batches[dst_batch_idx].attention_mask
         position_ids = batches[dst_batch_idx].position_ids
         past_key_values = batches[dst_batch_idx].past_key_values
@@ -398,6 +415,7 @@ class CausalLMBatch(Batch):
             batch_id=batch_id,
             requests=flat_requests,
             input_ids=input_ids,
+            pixel_values=pixel_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=past_key_values,
@@ -412,13 +430,14 @@ class CausalLMBatch(Batch):
     def from_pb(
         cls,
         pb: generate_pb2.Batch,
-        tokenizer: PreTrainedTokenizerBase,
+        processor: LlavaProcessor,
         dtype: torch.dtype,
         device: torch.device,
         is_optimized_for_gaudi: bool = False,
-    ) -> "CausalLMBatch":
+        warmup: bool = False,
+    ) -> "LlavaBatch":
         dbg_trace('FROM_PB', f'num_reqs:{len(pb.requests)}')
-        requests = [CausalLMRequest.from_pb(idx, req, tokenizer) for idx, req in enumerate(pb.requests)]
+        requests = [LlavaRequest.from_pb(idx, req, processor) for idx, req in enumerate(pb.requests)]
 
         max_input_length = max(r.data.truncate for r in requests)
         max_new_tokens = max(r.stopping_criteria.max_new_tokens for r in requests)
@@ -433,14 +452,48 @@ class CausalLMBatch(Batch):
         # was filtered out
         new_bs = round_up(len(requests), PREFILL_BATCH_BUCKET_SIZE)
         dummy_inputs = ["?"] * (new_bs - len(requests))
-        tokenized_inputs = tokenizer(
-            [r.data.inputs for r in requests] + dummy_inputs,
+        dummy_images = [None] * len(dummy_inputs) 
+
+        images = []
+        for r in requests:
+            if hasattr(r.data, "images"):
+                images.append(b64_decode(r.data.images))
+        else:
+            images.append(None)
+        images += dummy_images
+
+        # HACK(Joey Chou)
+        images = None 
+
+        # tokenized_inputs = processor.tokenizer(
+        #     [r.data.inputs for r in requests] + dummy_inputs,
+        #     return_tensors="pt",
+        #     padding="longest",
+        #     return_token_type_ids=False,
+        #     truncation=True,
+        #     max_length=max_input_length,
+        # )
+
+        # Break processor into 2 steps
+        if images is not None:
+            pixel_values = processor.image_processor(images, return_tensors="pt")["pixel_values"]
+        else:
+            pixel_values = None
+
+        # if not warmup:
+        #     raise Exception([r.data.inputs for r in requests])
+
+        tokenized_texts = processor.tokenizer(
+            text=[r.data.inputs for r in requests] + dummy_inputs,
+            # images=images,
             return_tensors="pt",
             padding="longest",
+            # TODO(Joey Chou): return_token_type_ids isn't supported in LlavaProcessor API. Try to break it if needed
             return_token_type_ids=False,
             truncation=True,
             max_length=max_input_length,
         )
+        tokenized_inputs = BatchFeature(data={**tokenized_texts, "pixel_values": pixel_values})
 
         input_len = tokenized_inputs["input_ids"].shape[1]
 
@@ -452,18 +505,19 @@ class CausalLMBatch(Batch):
             left_padding = bucket_size - input_len
 
         input_ids = tokenized_inputs["input_ids"]
+        pixel_values = tokenized_inputs["pixel_values"]
         attention_mask = tokenized_inputs["attention_mask"]
 
         if is_optimized_for_gaudi:
             # Allocate space for first token
             input_ids = torch.nn.functional.pad(
-                input_ids, (left_padding, 1), value=tokenizer.pad_token_id
+                input_ids, (left_padding, 1), value=processor.tokenizer.pad_token_id
             )
             attention_mask = torch.nn.functional.pad(
                 attention_mask, (left_padding, 1), value=0
             )
             all_input_ids = torch.nn.functional.pad(
-                input_ids, (0, max_new_tokens), value=tokenizer.pad_token_id
+                input_ids, (0, max_new_tokens), value=processor.tokenizer.pad_token_id
             ).T.split(1, dim=1)
         else:
             all_input_ids = input_ids.clone().T.split(1, dim=1)
@@ -477,6 +531,7 @@ class CausalLMBatch(Batch):
             r.all_input_ids = all_input_ids[r.idx]
 
         input_ids = input_ids.to(device)
+        pixel_values = None if pixel_values is None else pixel_values.to(device)
         attention_mask = attention_mask.to(device)
         position_ids = attention_mask.long().cumsum(-1) - 1
         position_ids.masked_fill_(attention_mask == 0, 1)
@@ -487,6 +542,7 @@ class CausalLMBatch(Batch):
             batch_id=pb.id,
             requests=requests,
             input_ids=input_ids,
+            pixel_values=pixel_values,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_values=None,
@@ -498,7 +554,7 @@ class CausalLMBatch(Batch):
         )
 
     @tracer.start_as_current_span("filter")
-    def filter(self, request_ids: List[int]) -> Optional["CausalLMBatch"]:
+    def filter(self, request_ids: List[int]) -> Optional["LlavaBatch"]:
         dbg_trace('FILTER', f'num_reqs:{len(self.requests)} -> {len(request_ids)}')
         request_ids = set(request_ids)
         self.requests = [req for req in self.requests if req.data.id in request_ids]
@@ -506,8 +562,7 @@ class CausalLMBatch(Batch):
 
     @classmethod
     @tracer.start_as_current_span("concatenate")
-    def concatenate(cls, batches: List["CausalLMBatch"], pad_token_id: int = 0) -> "CausalLMBatch":
-        raise Exception("Concat")
+    def concatenate(cls, batches: List["LlavaBatch"], pad_token_id: int = 0) -> "LlavaBatch":
         return cls.recombine(batches, pad_token_id)
 
     def __len__(self):
@@ -536,7 +591,7 @@ class CausalLMBatch(Batch):
         return len(self.requests) * max_total_tokens
 
 
-class CausalLM(Model):
+class Llava(Model):
     def __init__(
         self,
         model_id: str,
@@ -549,17 +604,19 @@ class CausalLM(Model):
 
         dtype = torch.bfloat16 if dtype is None else dtype
 
+        # HACK(Joey Chou)
         from optimum.habana.transformers.modeling_utils import adapt_transformers_to_gaudi
-
         adapt_transformers_to_gaudi()
+        from transformers import LlavaForConditionalGeneration
 
-        tokenizer = AutoTokenizer.from_pretrained(
+        processor = AutoProcessor.from_pretrained(
             model_id,
             revision=revision,
-            padding_side="left",
-            truncation_side="left",
+            # TODO(Joey Chou): Check if using 'left' is correct
         )
-        make_tokenizer_optional(tokenizer)
+        processor.tokenizer.padding_side = "left"  # default is `left`
+        processor.tokenizer.truncation_side = "left"  # default is `right`
+        make_processor_optional(processor)
 
         model_kwargs = {
             "revision": revision,
@@ -584,18 +641,22 @@ class CausalLM(Model):
             logger.info(
                 "DeepSpeed is enabled. world_size {} rank {} local_rank {}".format(world_size, rank, local_rank)
             )
+
+            # Model
+            # model.language_model: GaudiLlamaForCausalLM
+            # model.vision_tower: CLIPVisionModel
             config = AutoConfig.from_pretrained(model_id, **model_kwargs)
             load_to_meta = model_on_meta(config)
 
             if load_to_meta:
                 # Construct model with fake meta tensors, later will be replaced on devices during ds-inference ckpt load
                 with deepspeed.OnDevice(dtype=dtype, device="meta"):
-                    model = AutoModelForCausalLM.from_config(config, torch_dtype=dtype)
+                    model = LlavaForConditionalGeneration.from_config(config, torch_dtype=dtype)
             else:
                 get_repo_root(model_id, local_rank=os.getenv("LOCAL_RANK"))
                 # TODO: revisit placement on CPU when auto-injection is possible
                 with deepspeed.OnDevice(dtype=dtype, device="cpu"):
-                    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=dtype, **model_kwargs)
+                    model = LlavaForConditionalGeneration.from_pretrained(model_id, torch_dtype=dtype, **model_kwargs)
             model = model.eval()
 
             # Initialize the model
@@ -617,11 +678,12 @@ class CausalLM(Model):
 
         else:
             get_repo_root(model_id)
-            model = AutoModelForCausalLM.from_pretrained(
+            model = LlavaForConditionalGeneration.from_pretrained(
                 model_id,
                 revision=revision,
                 torch_dtype=dtype,
             )
+
             model = self.prepare_model_for_quantization(model)
             model = model.eval().to(device)
             # wrap in hpu_graph only if self.enable_hpu_graph is set
@@ -630,20 +692,22 @@ class CausalLM(Model):
                 model = wrap_in_hpu_graph(model, disable_tensor_cache=True)
         model = self.setup_quantization(model)
 
-        if model.config.model_type in MODELS_OPTIMIZED_WITH_STATIC_SHAPES:
-            self.is_optimized_for_gaudi = True
-        else:
-            self.is_optimized_for_gaudi = False
+        # HACK(Joey Chou): Force is_optimized_for_gaudi to True
+        # if model.config.model_type in MODELS_OPTIMIZED_WITH_STATIC_SHAPES:
+        #     self.is_optimized_for_gaudi = True
+        # else:
+        #     self.is_optimized_for_gaudi = False
+        self.is_optimized_for_gaudi = True
 
-        if tokenizer.pad_token_id is None:
+        if processor.tokenizer.pad_token_id is None:
             if model.config.pad_token_id is not None:
-                tokenizer.pad_token_id = model.config.pad_token_id
+                processor.tokenizer.pad_token_id = model.config.pad_token_id
             elif model.config.eos_token_id is not None:
-                tokenizer.pad_token_id = model.config.eos_token_id
-            elif tokenizer.eos_token_id is not None:
-                tokenizer.pad_token_id = tokenizer.eos_token_id
+                processor.tokenizer.pad_token_id = model.config.eos_token_id
+            elif processor.tokenizer.eos_token_id is not None:
+                processor.tokenizer.pad_token_id = processor.tokenizer.eos_token_id
             else:
-                tokenizer.add_special_tokens({"pad_token": "[PAD]"})
+                processor.tokenizer.add_special_tokens({"pad_token": "[PAD]"})
 
         kwargs = {
             "use_cache": True,
@@ -654,9 +718,9 @@ class CausalLM(Model):
             kwargs["attn_softmax_bf16"] = True
             kwargs["trim_logits"] = True
 
-        super(CausalLM, self).__init__(
+        super(Llava, self).__init__(
             model=model,
-            tokenizer=tokenizer,
+            tokenizer=processor,
             requires_padding=True,
             dtype=dtype,
             device=device,
@@ -681,6 +745,7 @@ class CausalLM(Model):
             self.hb_profiler = None
         self.step = 0
 
+    # # TODO(Joey Chou): Enable this later
     def setup_quantization(self, model):
         if hq_env.is_quantization_enabled:
             htorch.core.quantization._mark_params_as_const(model)
@@ -688,6 +753,7 @@ class CausalLM(Model):
             htorch.core.hpu_initialize(model)
         return model
 
+    # # TODO(Joey Chou): Enable this later
     def prepare_model_for_quantization(self, model):
         if hq_env.is_quantization_enabled:
             if model.config.model_type == "llama":
@@ -696,6 +762,7 @@ class CausalLM(Model):
             habana_quantization_toolkit.prep_model(model)
         return model
 
+    # # TODO(Joey Chou): Enable this later
     def finish_quantization_measurements(self, model):
         if hq_env.is_quantization_enabled:
             import habana_quantization_toolkit
@@ -712,11 +779,11 @@ class CausalLM(Model):
             self.patch_scoped_linear_all_reduce(module)
 
     @property
-    def batch_type(self) -> Type[CausalLMBatch]:
-        return CausalLMBatch
+    def batch_type(self) -> Type[LlavaBatch]:
+        return LlavaBatch
 
     def decode(self, generated_ids: List[int]) -> str:
-        return self.tokenizer.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+        return self.processor.decode(generated_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False)
 
     def decode_token(
         self,
@@ -724,8 +791,8 @@ class CausalLM(Model):
         prefix_offset: int = 0,
         read_offset: int = 0,
     ) -> Tuple[str, int, int]:
-        if is_tokenizer_transparent(self.tokenizer):
-            new_text = self.tokenizer.decode(all_input_ids[read_offset:], skip_special_tokens=False)
+        if is_tokenizer_transparent(self.processor):
+            new_text = self.processor.decode(all_input_ids[read_offset:], skip_special_tokens=False)
             return new_text, read_offset, len(all_input_ids)
         else:
             return super().decode_token(all_input_ids, prefix_offset, read_offset)
@@ -733,15 +800,19 @@ class CausalLM(Model):
     def forward(
         self,
         input_ids,
+        pixel_values: Optional, 
         attention_mask,
         position_ids,
         token_idx: Optional = None,
         past_key_values: Optional = None,
         bypass_hpu_graph: Optional = None,
+        stage = None,
     ) -> Tuple[torch.Tensor, List[Tuple[torch.Tensor, torch.Tensor]]]:
+
         # Model Forward
         kwargs = {
             "input_ids": input_ids,
+            "pixel_values": pixel_values,
             "attention_mask": attention_mask,
             "past_key_values": past_key_values,
         }
@@ -752,10 +823,15 @@ class CausalLM(Model):
         if self.has_position_ids:
             kwargs["position_ids"] = position_ids
 
+        # # TODO(Joey Chou): Check if need to use Prepare input or implement the prepare_inputs_for_generation into Llava
+        # kwargs = self.model.prepare_inputs_for_generation(**kwargs)
+
+        # TODO(Joey Chou): Check if this is the same as `hpu_graphs` variable
         if bypass_hpu_graph != None:
             kwargs["bypass_hpu_graphs"] = bypass_hpu_graph
 
         kwargs.update(self.kwargs)
+
         if past_key_values is not None:
             return self.model.forward(**kwargs)
         else:
@@ -763,7 +839,7 @@ class CausalLM(Model):
             return outputs.logits, outputs.past_key_values
 
     @tracer.start_as_current_span("generate_token")
-    def generate_token(self, batches: List[CausalLMBatch], stage: str = "None") -> Tuple[List[Generation], Optional[CausalLMBatch]]:
+    def generate_token(self, batches: List[LlavaBatch], stage: str = "None") -> Tuple[List[Generation], Optional[LlavaBatch]]:
         # Results
         generations: List[Generation] = []
         prev_batches = []
@@ -774,6 +850,8 @@ class CausalLM(Model):
             if batch.logits is not None:
                 logits = batch.logits
                 past = batch.past
+                # raise Exception(batch.past_key_values)
+                # raise Exception(past)
                 prefill = batch.past_key_values is None
                 if self.is_optimized_for_gaudi:
                     if prefill:
@@ -796,6 +874,7 @@ class CausalLM(Model):
                     next_token_ids, next_token_logprobs, logprobs = batch.next_token_chooser(
                         batch.input_ids[:, :token_idx_scalar], logits.squeeze(-2)
                     )
+                # raise Exception(f"{next_token_ids.shape} \n\n {next_token_logprobs.shape} \n\n {logprobs.shape}")
                 batch_top_token_ids, batch_top_token_logprobs = batch_top_tokens(
                     batch.top_n_tokens,
                     batch.top_n_tokens_tensor,
@@ -837,8 +916,8 @@ class CausalLM(Model):
                     batch.attention_mask[:, -batch.padding_right_offset] = 1
 
                 # Adjust lengths
+                # 128, 127, 1
                 # raise Exception(batch.seq_length, batch.input_length, batch.right_padding)
-                # raise Exception(prefill)
                 batch.input_length += 1
 
                 # Update position_ids
@@ -854,7 +933,7 @@ class CausalLM(Model):
 
         # Stage 2. Prepare new batch for speculative scheduling
         if len(batches) > 1:
-            batch = self.batch_type.concatenate(batches, self.tokenizer.pad_token_id)
+            batch = self.batch_type.concatenate(batches, self.processor.tokenizer.pad_token_id)
         else:
             batch = batches[0]
 
@@ -862,17 +941,15 @@ class CausalLM(Model):
 
         # Check if we need to do any bookkeeping first
         if not prefill:
-            batch = batch.__class__.recombine([batch], self.tokenizer.pad_token_id)
-            if batch.logits is not None:
-                raise Exception(batch.seq_length, batch.input_length, batch.right_padding)
+            batch = batch.__class__.recombine([batch], self.processor.tokenizer.pad_token_id)
 
         scenario = 'PREFILL' if prefill else 'GENERATE'
         dbg_trace(
             scenario, f'bs:{batch.batch_size} num_reqs:{len(batch.requests)} seq_len:{batch.seq_length} padding:{batch.right_padding}')
-        if stage == "2nd":
-            pass
-            # raise Exception(batch.seq_length, batch.input_length, batch.right_padding)
-            # raise Exception(batch.attention_mask.size(), batch.input_ids.size())
+        # if stage == "2nd" and batch.right_padding <= 0:
+        #     pass
+        #     # raise Exception(batch.seq_length, batch.input_length, batch.right_padding)
+        #     # raise Exception(batch.attention_mask.size(), batch.input_ids.size())
         assert batch.right_padding > 0, 'No more room for next token!'
 
         if self.is_optimized_for_gaudi:
@@ -893,23 +970,28 @@ class CausalLM(Model):
         else:
             input_ids = batch.input_ids
 
+        pixel_values = batch.pixel_values
         if prefill:
             batch.logits, batch.past = self.forward(
                 input_ids,
+                pixel_values,
                 attention_mask,
                 batch.position_ids,
                 token_idx,
                 batch.past_key_values,
-                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
+                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None,
+                stage=stage,
             )
         else:
             batch.logits = self.forward(
                 input_ids,
+                pixel_values,
                 attention_mask,
                 batch.position_ids,
                 token_idx,
                 batch.past_key_values,
-                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None
+                bypass_hpu_graph=prefill and self.limit_hpu_graph if self.enable_hpu_graph else None,
+                stage=stage,
             )
 
         htorch.core.mark_step()
@@ -951,7 +1033,7 @@ class CausalLM(Model):
             new_input_length = input_length + 1
 
             # Generated token
-            if is_tokenizer_transparent(self.tokenizer) and len(stopping_criteria.stop_sequence_criterias) == 0:
+            if is_tokenizer_transparent(self.processor) and len(stopping_criteria.stop_sequence_criterias) == 0:
                 next_token_text = ''
             else:
                 next_token_text, prefix_offset, read_offset = self.decode_token(
@@ -972,7 +1054,7 @@ class CausalLM(Model):
             if i % self.world_size == self.rank:
                 if stop:
                     # Decode generated tokens
-                    if is_tokenizer_transparent(self.tokenizer):
+                    if is_tokenizer_transparent(self.processor):
                         output_text = None
                     else:
                         output_text = self.decode(
@@ -992,7 +1074,7 @@ class CausalLM(Model):
                     # Remove generated token to only have prefill and add nan for first prompt token
                     prefill_logprobs = [float("nan")] + next_token_logprobs
                     prefill_token_ids = all_input_ids[0: new_input_length - 1]
-                    prefill_texts = self.tokenizer.batch_decode(
+                    prefill_texts = self.processor.batch_decode(
                         prefill_token_ids,
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
@@ -1002,7 +1084,7 @@ class CausalLM(Model):
                     prefill_tokens = None
 
                 if top_n_tokens > 0:
-                    toptoken_texts = self.tokenizer.batch_decode(
+                    toptoken_texts = self.processor.batch_decode(
                         top_token_ids,
                         clean_up_tokenization_spaces=False,
                         skip_special_tokens=False,
@@ -1044,7 +1126,7 @@ class CausalLM(Model):
                 self.hb_profiler.step()
         return generations, batch if not stopped else None
 
-    def warmup(self, batches: List[CausalLMBatch]) -> None:
+    def warmup(self, batches: List[LlavaBatch]) -> None:
         if len(batches) < 2:
             return
 
@@ -1055,14 +1137,15 @@ class CausalLM(Model):
         # shifts
         self.shifting_warmup(decode_batch)
         # prefill
-        _, prefill_batch = self.generate_token([batches.pop(0)])
+        _, prefill_batch = self.generate_token([batches.pop(0)], "3rd")
         # concatenate and decode
-        _, decode_batch = self.generate_token([decode_batch, prefill_batch])
+        _, decode_batch = self.generate_token([decode_batch, prefill_batch], "4th")
         # decodes
         while decode_batch is not None:
-            _, decode_batch = self.generate_token([decode_batch])
+            _, decode_batch = self.generate_token([decode_batch], "5th")
+        
 
-    def shifting_warmup(self, batch: CausalLMBatch) -> None:
+    def shifting_warmup(self, batch: LlavaBatch) -> None:
         chunk_sizes = CHUNK_SIZES.copy()
         chunk_sizes.extend([-chunk for chunk in chunk_sizes])
 
